@@ -1,0 +1,4 @@
+private-deployer-source/
+.wrangler/
+node_modules/
+.env

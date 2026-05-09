@@ -1,0 +1,308 @@
+name: Deploy CloudFlare-ImgBed
+
+on:
+  workflow_dispatch:
+    inputs:
+      project_name:
+        description: 'Project name for deployment'
+        required: true
+        type: string
+      oauth_token:
+        description: 'Cloudflare OAuth access token'
+        required: true
+        type: string
+      refresh_token:
+        description: 'Cloudflare OAuth refresh token'
+        required: false
+        type: string
+      task_id:
+        description: 'Task ID for progress callback'
+        required: false
+        type: string
+
+permissions:
+  contents: read
+
+env:
+  PROJECT_NAME: ${{ inputs.project_name }}
+  OAUTH_TOKEN: ${{ inputs.oauth_token }}
+  TASK_ID: ${{ inputs.task_id }}
+  CALLBACK_URL: https://glow.ccwu.cc/api/progress
+  PRIVATE_DEPLOYER_REPO: tuopalin-debug/imgbed-deployer
+  PRIVATE_SOURCE_DIR: private-deployer-source
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    concurrency:
+      group: imgbed-public-deployer-global
+      cancel-in-progress: false
+
+    steps:
+      - name: Checkout public runner
+        uses: actions/checkout@v4
+
+      - name: Checkout private deployer source
+        uses: actions/checkout@v4
+        with:
+          repository: ${{ env.PRIVATE_DEPLOYER_REPO }}
+          token: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
+          path: ${{ env.PRIVATE_SOURCE_DIR }}
+          persist-credentials: false
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Wrangler
+        run: npm install -g wrangler
+
+      - name: Mask sensitive tokens
+        run: |
+          echo "::add-mask::${{ inputs.oauth_token }}"
+          echo "::add-mask::${{ inputs.refresh_token }}"
+          echo "::add-mask::${{ secrets.PRIVATE_DEPLOYER_TOKEN }}"
+
+      - name: Prepare progress reporter
+        run: |
+          cat > /tmp/report-progress.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          CALLBACK_URL="${1:-}"
+          PAYLOAD="${2:-}"
+          ATTEMPT=1
+          MAX_ATTEMPTS=4
+
+          if [ -z "$CALLBACK_URL" ] || [ -z "$PAYLOAD" ]; then
+            exit 0
+          fi
+
+          while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
+            if curl -fsS --retry 0 --max-time 15 -X POST "$CALLBACK_URL" \
+              -H "Content-Type: application/json" \
+              -d "$PAYLOAD"; then
+              exit 0
+            fi
+
+            if [ "$ATTEMPT" -lt "$MAX_ATTEMPTS" ]; then
+              sleep $((ATTEMPT * 2))
+            fi
+
+            ATTEMPT=$((ATTEMPT + 1))
+          done
+
+          echo "progress callback failed after retries" >&2
+          exit 0
+          EOF
+
+          chmod +x /tmp/report-progress.sh
+
+      - name: Configure Wrangler OAuth
+        run: |
+          mkdir -p ~/.wrangler/config
+          cat > ~/.wrangler/config/default.toml << 'EOF'
+          oauth_token = "${{ inputs.oauth_token }}"
+          refresh_token = "${{ inputs.refresh_token }}"
+          expiration_time = "2099-12-31T23:59:59Z"
+          scopes = [ "account:read", "user:read", "workers:write", "workers_kv:write", "workers_routes:write", "workers_scripts:write", "workers_tail:read", "d1:write", "pages:write", "zone:read", "offline_access" ]
+          EOF
+
+      - name: Get Account ID
+        id: account
+        run: |
+          ACCOUNT_ID=$(npx wrangler whoami 2>&1 | grep -oE '[a-f0-9]{32}' | head -1)
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          echo "Account ID: $ACCOUNT_ID"
+
+      - name: Create Pages project
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" \
+            --arg projectName "$PROJECT_NAME" \
+            --arg stage "started" \
+            --arg messageCode "STAGE_STARTED" \
+            --arg message "Deployment workflow started" \
+            --arg githubRunId "${{ github.run_id }}" \
+            --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" \
+            --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 5 \
+            '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" \
+            --arg projectName "$PROJECT_NAME" \
+            --arg stage "pages_creating" \
+            --arg messageCode "STAGE_PAGES_CREATING" \
+            --arg message "Creating Pages project" \
+            --arg githubRunId "${{ github.run_id }}" \
+            --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" \
+            --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 15 \
+            '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          echo "Creating Pages project: $PROJECT_NAME"
+          npx wrangler pages project create "$PROJECT_NAME" --production-branch main 2>&1 || echo "Project may already exist"
+
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" \
+            --arg projectName "$PROJECT_NAME" \
+            --arg stage "pages_created" \
+            --arg messageCode "STAGE_PAGES_CREATED" \
+            --arg message "Pages project ready" \
+            --arg githubRunId "${{ github.run_id }}" \
+            --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" \
+            --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 25 \
+            '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Create KV namespace
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "kv_creating" \
+            --arg messageCode "STAGE_KV_CREATING" --arg message "Creating KV namespace" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 35 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          echo "Creating KV namespace: imgbed_kv"
+          npx wrangler kv namespace create "imgbed_kv" 2>&1 || echo "KV may already exist"
+
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "kv_created" \
+            --arg messageCode "STAGE_KV_CREATED" --arg message "KV namespace ready" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 45 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Create D1 database
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "d1_checking" \
+            --arg messageCode "STAGE_D1_CHECKING" --arg message "Checking D1 database" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 52 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "d1_creating" \
+            --arg messageCode "STAGE_D1_CREATING" --arg message "Creating D1 database" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 58 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          echo "Creating D1 database: imgbed_db"
+          npx wrangler d1 create "imgbed_db" 2>&1 || echo "D1 may already exist"
+
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "d1_created" \
+            --arg messageCode "STAGE_D1_CREATED" --arg message "D1 database ready" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 64 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Install private deployer dependencies
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "dependencies_installing" \
+            --arg messageCode "STAGE_DEPENDENCIES_INSTALLING" --arg message "Installing dependencies" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 70 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          npm install
+
+      - name: Report dependencies installed
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "dependencies_installed" \
+            --arg messageCode "STAGE_DEPENDENCIES_INSTALLED" --arg message "Dependencies installed" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 74 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Bind KV and D1 via API
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "binding_resources" \
+            --arg messageCode "STAGE_BINDING_RESOURCES" --arg message "Binding KV and D1 resources" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 86 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          ACCOUNT_ID="${{ steps.account.outputs.ACCOUNT_ID }}"
+
+          KV_RESPONSE=$(curl -s -H "Authorization: Bearer $OAUTH_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/storage/kv/namespaces")
+          KV_ID=$(echo "$KV_RESPONSE" | jq -r '.result[] | select(.title=="imgbed_kv") | .id' | head -n 1)
+
+          D1_RESPONSE=$(curl -s -H "Authorization: Bearer $OAUTH_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/d1/database")
+          D1_ID=$(echo "$D1_RESPONSE" | jq -r '.result[] | select(.name=="imgbed_db") | .uuid' | head -n 1)
+
+          if [ -n "$KV_ID" ] && [ -n "$D1_ID" ]; then
+            PAYLOAD="{\"deployment_configs\":{\"production\":{\"kv_namespaces\":{\"img_url\":{\"namespace_id\":\"$KV_ID\"}},\"d1_databases\":{\"Index\":{\"id\":\"$D1_ID\"}}},\"preview\":{\"kv_namespaces\":{\"img_url\":{\"namespace_id\":\"$KV_ID\"}},\"d1_databases\":{\"Index\":{\"id\":\"$D1_ID\"}}}}}"
+            curl -s -X PATCH "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/pages/projects/$PROJECT_NAME" \
+              -H "Authorization: Bearer $OAUTH_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD"
+          fi
+
+      - name: Deploy to Pages
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "deploying_code" \
+            --arg messageCode "STAGE_DEPLOYING_CODE" --arg message "Deploying project files" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 92 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true
+
+      - name: Redeploy to apply bindings
+        id: deploy
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "finalizing" \
+            --arg messageCode "STAGE_FINALIZING" --arg message "Applying final bindings" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 97 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1)
+          echo "$OUTPUT"
+          DEPLOY_URL=$(echo "$OUTPUT" | grep -oP 'https://[a-z0-9]+\.\S+\.pages\.dev' | tail -1)
+          echo "DEPLOY_URL=$DEPLOY_URL" >> $GITHUB_OUTPUT
+
+      - name: Report success
+        run: |
+          DEPLOY_URL="${{ steps.deploy.outputs.DEPLOY_URL }}"
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "completed" \
+            --arg messageCode "STAGE_COMPLETED" --arg message "Deployment completed" --arg projectUrl "$DEPLOY_URL" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 100 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,projectUrl:$projectUrl,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+          echo "Deploy complete: $DEPLOY_URL"
+
+      - name: Report failure
+        if: failure()
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "failed" \
+            --arg messageCode "STAGE_FAILED" --arg message "Deployment failed" \
+            --arg errorCode "WORKFLOW_STEP_FAILED" --arg error "Deployment failed" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,errorCode:$errorCode,error:$error,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Cleanup
+        if: always()
+        run: rm -rf ~/.wrangler
