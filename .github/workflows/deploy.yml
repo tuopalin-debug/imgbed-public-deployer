@@ -28,7 +28,6 @@ env:
   OAUTH_TOKEN: ${{ inputs.oauth_token }}
   TASK_ID: ${{ inputs.task_id }}
   CALLBACK_URL: https://glow.ccwu.cc/api/progress
-  PRIVATE_DEPLOYER_REPO: tuopalin-debug/CloudFlare-ImgBed-pages
   PRIVATE_SOURCE_DIR: private-deployer-source
 
 jobs:
@@ -45,7 +44,7 @@ jobs:
       - name: Checkout private deployer source
         uses: actions/checkout@v4
         with:
-          repository: ${{ env.PRIVATE_DEPLOYER_REPO }}
+          repository: ${{ secrets.PRIVATE_DEPLOYER_REPO }}
           token: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
           path: ${{ env.PRIVATE_SOURCE_DIR }}
           persist-credentials: false
