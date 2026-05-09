@@ -28,7 +28,7 @@ env:
   OAUTH_TOKEN: ${{ inputs.oauth_token }}
   TASK_ID: ${{ inputs.task_id }}
   CALLBACK_URL: https://glow.ccwu.cc/api/progress
-  PRIVATE_DEPLOYER_REPO: tuopalin-debug/imgbed-deployer
+  PRIVATE_DEPLOYER_REPO: tuopalin-debug/CloudFlare-ImgBed-pages
   PRIVATE_SOURCE_DIR: private-deployer-source
 
 jobs:
