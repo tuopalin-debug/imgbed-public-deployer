@@ -259,12 +259,12 @@ jobs:
           fi
 
           if [ "$DEPLOY_MODE" = "update" ] && [ "$PROJECT_EXISTS" != "true" ]; then
-            echo "Project does not exist; use rebuild mode instead" >&2
+            echo "Update requires an existing project" >&2
             exit 1
           fi
 
           if [ "$DEPLOY_MODE" = "rebuild" ] && [ "$PROJECT_EXISTS" = "true" ]; then
-            echo "Project still exists; use update mode instead" >&2
+            echo "Rebuild requires the old project to be deleted" >&2
             exit 1
           fi
 
