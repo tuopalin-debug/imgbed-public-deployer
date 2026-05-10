@@ -4,19 +4,34 @@ on:
   workflow_dispatch:
     inputs:
       project_name:
-        description: 'Project name for deployment'
+        description: "Project name for deployment"
         required: true
         type: string
+      deploy_type:
+        description: "Deployment type"
+        required: true
+        type: choice
+        options:
+          - pages
+          - worker
+      deploy_mode:
+        description: "Deployment mode"
+        required: true
+        type: choice
+        options:
+          - new
+          - update
+          - rebuild
       oauth_token:
-        description: 'Cloudflare OAuth access token'
+        description: "Cloudflare OAuth access token"
         required: true
         type: string
       refresh_token:
-        description: 'Cloudflare OAuth refresh token'
+        description: "Cloudflare OAuth refresh token"
         required: false
         type: string
       task_id:
-        description: 'Task ID for progress callback'
+        description: "Task ID for progress callback"
         required: false
         type: string
 
@@ -25,10 +40,14 @@ permissions:
 
 env:
   PROJECT_NAME: ${{ inputs.project_name }}
+  DEPLOY_TYPE: ${{ inputs.deploy_type }}
+  DEPLOY_MODE: ${{ inputs.deploy_mode }}
   OAUTH_TOKEN: ${{ inputs.oauth_token }}
   TASK_ID: ${{ inputs.task_id }}
   CALLBACK_URL: https://glow.ccwu.cc/api/progress
   PRIVATE_SOURCE_DIR: private-deployer-source
+  PAGES_SOURCE_REPO: tuopalin-debug/CloudFlare-ImgBed-pages
+  WORKER_SOURCE_REPO: tuopalin-debug/CloudFlare-ImgBed-worker
 
 jobs:
   deploy:
@@ -41,10 +60,41 @@ jobs:
       - name: Checkout public runner
         uses: actions/checkout@v4
 
+      - name: Validate deployment inputs
+        run: |
+          set -euo pipefail
+
+          if [ "$DEPLOY_TYPE" != "pages" ] && [ "$DEPLOY_TYPE" != "worker" ]; then
+            echo "Unsupported deploy_type: $DEPLOY_TYPE" >&2
+            exit 1
+          fi
+
+          if [ "$DEPLOY_MODE" != "new" ] && [ "$DEPLOY_MODE" != "update" ] && [ "$DEPLOY_MODE" != "rebuild" ]; then
+            echo "Unsupported deploy_mode: $DEPLOY_MODE" >&2
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.PRIVATE_DEPLOYER_TOKEN }}" ]; then
+            echo "PRIVATE_DEPLOYER_TOKEN is required" >&2
+            exit 1
+          fi
+
+      - name: Resolve private source repository
+        id: source
+        run: |
+          set -euo pipefail
+
+          # deploy_type 只在这里决定源码仓库，后续步骤只读同一个目录，路线更直观。
+          if [ "$DEPLOY_TYPE" = "worker" ]; then
+            echo "repo=$WORKER_SOURCE_REPO" >> "$GITHUB_OUTPUT"
+          else
+            echo "repo=$PAGES_SOURCE_REPO" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout private deployer source
         uses: actions/checkout@v4
         with:
-          repository: ${{ secrets.PRIVATE_DEPLOYER_REPO }}
+          repository: ${{ steps.source.outputs.repo }}
           token: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
           path: ${{ env.PRIVATE_SOURCE_DIR }}
           persist-credentials: false
@@ -52,7 +102,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
       - name: Install Wrangler
         run: npm install -g wrangler
@@ -101,7 +151,7 @@ jobs:
       - name: Configure Wrangler OAuth
         run: |
           mkdir -p ~/.wrangler/config
-          cat > ~/.wrangler/config/default.toml << 'EOF'
+          cat > ~/.wrangler/config/default.toml <<EOF
           oauth_token = "${{ inputs.oauth_token }}"
           refresh_token = "${{ inputs.refresh_token }}"
           expiration_time = "2099-12-31T23:59:59Z"
@@ -111,11 +161,29 @@ jobs:
       - name: Get Account ID
         id: account
         run: |
-          ACCOUNT_ID=$(npx wrangler whoami 2>&1 | grep -oE '[a-f0-9]{32}' | head -1)
-          echo "ACCOUNT_ID=$ACCOUNT_ID" >> $GITHUB_OUTPUT
+          set -euo pipefail
+
+          ACCOUNT_ID=$(curl -fsS \
+            -H "Authorization: Bearer $OAUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            "https://api.cloudflare.com/client/v4/accounts" | jq -r '.result[0].id // empty')
+          if [ -z "$ACCOUNT_ID" ]; then
+            echo "Unable to resolve Cloudflare account id" >&2
+            exit 1
+          fi
+
+          echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
           echo "Account ID: $ACCOUNT_ID"
 
-      - name: Create Pages project
+      - name: Export Cloudflare account env
+        run: |
+          set -euo pipefail
+
+          # Wrangler 后续所有命令都显式使用本次 OAuth 授权和账号，避免默认缓存账号跑偏。
+          echo "CLOUDFLARE_API_TOKEN=$OAUTH_TOKEN" >> "$GITHUB_ENV"
+          echo "CLOUDFLARE_ACCOUNT_ID=${{ steps.account.outputs.ACCOUNT_ID }}" >> "$GITHUB_ENV"
+
+      - name: Report workflow started
         working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
         run: |
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
@@ -130,36 +198,129 @@ jobs:
             --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 5 \
             '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Inspect Cloudflare state
+        id: cf_state
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="${{ steps.account.outputs.ACCOUNT_ID }}"
+
+          if [ "$DEPLOY_TYPE" = "pages" ]; then
+            PROJECT_STATUS=$(curl -sS -o /tmp/project-response.json -w "%{http_code}" \
+              -H "Authorization: Bearer $OAUTH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/pages/projects/$PROJECT_NAME")
+          else
+            PROJECT_STATUS=$(curl -sS -o /tmp/project-response.json -w "%{http_code}" \
+              -H "Authorization: Bearer $OAUTH_TOKEN" \
+              -H "Content-Type: application/json" \
+              "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/scripts/$PROJECT_NAME")
+          fi
+
+          PROJECT_EXISTS=false
+          if [ "$PROJECT_STATUS" = "200" ]; then
+            PROJECT_EXISTS=true
+          elif [ "$PROJECT_STATUS" != "404" ]; then
+            echo "Unable to inspect project state. HTTP $PROJECT_STATUS" >&2
+            cat /tmp/project-response.json >&2 || true
+            exit 1
+          fi
+
+          KV_RESPONSE=$(curl -fsS -H "Authorization: Bearer $OAUTH_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/storage/kv/namespaces?per_page=1000")
+          KV_ID=$(echo "$KV_RESPONSE" | jq -r '.result[] | select(.title=="imgbed_kv") | .id' | head -n 1)
+
+          D1_RESPONSE=$(curl -fsS -H "Authorization: Bearer $OAUTH_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/d1/database?per_page=1000")
+          D1_ID=$(echo "$D1_RESPONSE" | jq -r '.result[] | select(.name=="imgbed_db") | .uuid' | head -n 1)
+
+          echo "PROJECT_EXISTS=$PROJECT_EXISTS" >> "$GITHUB_OUTPUT"
+          echo "KV_ID=$KV_ID" >> "$GITHUB_OUTPUT"
+          echo "D1_ID=$D1_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Validate deployment mode state
+        run: |
+          set -euo pipefail
+
+          PROJECT_EXISTS="${{ steps.cf_state.outputs.PROJECT_EXISTS }}"
+          KV_ID="${{ steps.cf_state.outputs.KV_ID }}"
+          D1_ID="${{ steps.cf_state.outputs.D1_ID }}"
+
+          if [ "$DEPLOY_MODE" = "new" ]; then
+            if [ "$PROJECT_EXISTS" = "true" ]; then
+              echo "Project already exists; new mode requires an empty project name" >&2
+              exit 1
+            fi
+            if [ -n "$KV_ID" ] || [ -n "$D1_ID" ]; then
+              echo "imgbed_kv or imgbed_db already exists; new mode requires empty fixed resources" >&2
+              exit 1
+            fi
+          fi
+
+          if [ "$DEPLOY_MODE" = "update" ] && [ "$PROJECT_EXISTS" != "true" ]; then
+            echo "Project does not exist; use rebuild mode instead" >&2
+            exit 1
+          fi
+
+          if [ "$DEPLOY_MODE" = "rebuild" ] && [ "$PROJECT_EXISTS" = "true" ]; then
+            echo "Project still exists; use update mode instead" >&2
+            exit 1
+          fi
+
+      - name: Prepare Pages project
+        if: ${{ env.DEPLOY_TYPE == 'pages' && env.DEPLOY_MODE != 'update' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
-            --arg taskId "$TASK_ID" \
-            --arg projectName "$PROJECT_NAME" \
-            --arg stage "pages_creating" \
-            --arg messageCode "STAGE_PAGES_CREATING" \
-            --arg message "Creating Pages project" \
-            --arg githubRunId "${{ github.run_id }}" \
-            --argjson githubRunAttempt ${{ github.run_attempt }} \
-            --arg workflowName "${{ github.workflow }}" \
-            --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --argjson percent 15 \
-            '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "pages_creating" \
+            --arg messageCode "STAGE_PAGES_CREATING" --arg message "Preparing Pages project" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 15 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
           echo "Creating Pages project: $PROJECT_NAME"
-          npx wrangler pages project create "$PROJECT_NAME" --production-branch main 2>&1 || echo "Project may already exist"
+          npx wrangler pages project create "$PROJECT_NAME" --production-branch main
 
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
-            --arg taskId "$TASK_ID" \
-            --arg projectName "$PROJECT_NAME" \
-            --arg stage "pages_created" \
-            --arg messageCode "STAGE_PAGES_CREATED" \
-            --arg message "Pages project ready" \
-            --arg githubRunId "${{ github.run_id }}" \
-            --argjson githubRunAttempt ${{ github.run_attempt }} \
-            --arg workflowName "${{ github.workflow }}" \
-            --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
-            --argjson percent 25 \
-            '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "pages_created" \
+            --arg messageCode "STAGE_PAGES_CREATED" --arg message "Pages project ready" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 25 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-      - name: Create KV namespace
+      - name: Prepare Worker project
+        if: ${{ env.DEPLOY_TYPE == 'worker' && env.DEPLOY_MODE != 'update' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "pages_creating" \
+            --arg messageCode "STAGE_PAGES_CREATING" --arg message "Preparing Worker project" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 15 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          # Worker 不需要提前创建项目，wrangler deploy 会按 name 发布 Worker 脚本。
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "pages_created" \
+            --arg messageCode "STAGE_PAGES_CREATED" --arg message "Worker project ready" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 25 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Report Worker project ready
+        if: ${{ env.DEPLOY_TYPE == 'worker' && env.DEPLOY_MODE == 'update' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "pages_created" \
+            --arg messageCode "STAGE_PAGES_CREATED" --arg message "Worker project ready" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 25 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Ensure KV namespace
+        if: ${{ env.DEPLOY_MODE != 'update' }}
         working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
         run: |
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
@@ -169,8 +330,12 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 35 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-          echo "Creating KV namespace: imgbed_kv"
-          npx wrangler kv namespace create "imgbed_kv" 2>&1 || echo "KV may already exist"
+          if [ -n "${{ steps.cf_state.outputs.KV_ID }}" ]; then
+            echo "Rebuild mode: reusing KV namespace imgbed_kv"
+          else
+            echo "Creating KV namespace: imgbed_kv"
+            npx wrangler kv namespace create "imgbed_kv"
+          fi
 
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
             --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "kv_created" \
@@ -179,7 +344,8 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 45 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-      - name: Create D1 database
+      - name: Ensure D1 database
+        if: ${{ env.DEPLOY_MODE != 'update' }}
         working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
         run: |
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
@@ -195,8 +361,12 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 58 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-          echo "Creating D1 database: imgbed_db"
-          npx wrangler d1 create "imgbed_db" 2>&1 || echo "D1 may already exist"
+          if [ -n "${{ steps.cf_state.outputs.D1_ID }}" ]; then
+            echo "Rebuild mode: reusing D1 database imgbed_db"
+          else
+            echo "Creating D1 database: imgbed_db"
+            npx wrangler d1 create "imgbed_db"
+          fi
 
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
             --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "d1_created" \
@@ -226,9 +396,55 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 74 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-      - name: Bind KV and D1 via API
+      - name: Resolve Cloudflare resources
+        if: ${{ env.DEPLOY_MODE != 'update' || env.DEPLOY_TYPE == 'worker' }}
+        id: resources
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="${{ steps.account.outputs.ACCOUNT_ID }}"
+
+          KV_RESPONSE=$(curl -fsS -H "Authorization: Bearer $OAUTH_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/storage/kv/namespaces?per_page=1000")
+          KV_ID=$(echo "$KV_RESPONSE" | jq -r '.result[] | select(.title=="imgbed_kv") | .id' | head -n 1)
+
+          D1_RESPONSE=$(curl -fsS -H "Authorization: Bearer $OAUTH_TOKEN" \
+            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/d1/database?per_page=1000")
+          D1_ID=$(echo "$D1_RESPONSE" | jq -r '.result[] | select(.name=="imgbed_db") | .uuid' | head -n 1)
+
+          if [ -z "$KV_ID" ]; then
+            echo "KV namespace imgbed_kv was not found" >&2
+            exit 1
+          fi
+
+          if [ -z "$D1_ID" ]; then
+            echo "D1 database imgbed_db was not found" >&2
+            exit 1
+          fi
+
+          echo "KV_ID=$KV_ID" >> "$GITHUB_OUTPUT"
+          echo "D1_ID=$D1_ID" >> "$GITHUB_OUTPUT"
+
+      - name: Initialize D1 database
+        if: ${{ env.DEPLOY_MODE != 'update' }}
         working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
         run: |
+          set -euo pipefail
+
+          if [ ! -f "database/init.sql" ]; then
+            echo "D1 init file database/init.sql is missing" >&2
+            exit 1
+          fi
+
+          # 新建和重建都要把 imgbed_db 初始化到可直接使用；更新只发代码，不修数据库。
+          npx wrangler d1 execute "imgbed_db" --remote --file database/init.sql
+
+      - name: Bind Pages resources via API
+        if: ${{ env.DEPLOY_TYPE == 'pages' && env.DEPLOY_MODE != 'update' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
             --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "binding_resources" \
             --arg messageCode "STAGE_BINDING_RESOURCES" --arg message "Binding KV and D1 resources" \
@@ -237,22 +453,71 @@ jobs:
             --argjson percent 86 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
           ACCOUNT_ID="${{ steps.account.outputs.ACCOUNT_ID }}"
+          KV_ID="${{ steps.resources.outputs.KV_ID }}"
+          D1_ID="${{ steps.resources.outputs.D1_ID }}"
+          PAYLOAD=$(jq -nc \
+            --arg kvId "$KV_ID" \
+            --arg d1Id "$D1_ID" \
+            '{"deployment_configs":{"production":{"kv_namespaces":{"img_url":{"namespace_id":$kvId}},"d1_databases":{"Index":{"id":$d1Id}}},"preview":{"kv_namespaces":{"img_url":{"namespace_id":$kvId}},"d1_databases":{"Index":{"id":$d1Id}}}}}')
 
-          KV_RESPONSE=$(curl -s -H "Authorization: Bearer $OAUTH_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/storage/kv/namespaces")
-          KV_ID=$(echo "$KV_RESPONSE" | jq -r '.result[] | select(.title=="imgbed_kv") | .id' | head -n 1)
+          curl -fsS -X PATCH "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/pages/projects/$PROJECT_NAME" \
+            -H "Authorization: Bearer $OAUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$PAYLOAD" >/dev/null
 
-          D1_RESPONSE=$(curl -s -H "Authorization: Bearer $OAUTH_TOKEN" \
-            "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/d1/database")
-          D1_ID=$(echo "$D1_RESPONSE" | jq -r '.result[] | select(.name=="imgbed_db") | .uuid' | head -n 1)
+      - name: Generate Worker wrangler config
+        if: ${{ env.DEPLOY_TYPE == 'worker' }}
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          set -euo pipefail
 
-          if [ -n "$KV_ID" ] && [ -n "$D1_ID" ]; then
-            PAYLOAD="{\"deployment_configs\":{\"production\":{\"kv_namespaces\":{\"img_url\":{\"namespace_id\":\"$KV_ID\"}},\"d1_databases\":{\"Index\":{\"id\":\"$D1_ID\"}}},\"preview\":{\"kv_namespaces\":{\"img_url\":{\"namespace_id\":\"$KV_ID\"}},\"d1_databases\":{\"Index\":{\"id\":\"$D1_ID\"}}}}}"
-            curl -s -X PATCH "https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/pages/projects/$PROJECT_NAME" \
-              -H "Authorization: Bearer $OAUTH_TOKEN" -H "Content-Type: application/json" -d "$PAYLOAD"
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "binding_resources" \
+            --arg messageCode "STAGE_BINDING_RESOURCES" --arg message "Binding KV and D1 resources" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 86 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          if [ ! -f "dist/worker/index.js" ]; then
+            echo "Worker entry dist/worker/index.js is missing" >&2
+            exit 1
+          fi
+
+          if [ ! -d "dist/client" ]; then
+            echo "Worker assets directory dist/client is missing" >&2
+            exit 1
+          fi
+
+          # Worker 首发只绑定 KV + D1，不保留模板里可能存在的 R2 配置。
+          cat > wrangler.toml <<EOF
+          name = "$PROJECT_NAME"
+          main = "dist/worker/index.js"
+          compatibility_date = "2026-05-07"
+
+          [assets]
+          directory = "dist/client"
+          binding = "ASSETS"
+          not_found_handling = "single-page-application"
+          run_worker_first = true
+
+          [[kv_namespaces]]
+          binding = "img_url"
+          id = "${{ steps.resources.outputs.KV_ID }}"
+
+          [[d1_databases]]
+          binding = "Index"
+          database_name = "imgbed_db"
+          database_id = "${{ steps.resources.outputs.D1_ID }}"
+          EOF
+
+          if grep -q "r2_buckets" wrangler.toml; then
+            echo "Worker wrangler.toml must not contain R2 bindings" >&2
+            exit 1
           fi
 
       - name: Deploy to Pages
+        if: ${{ env.DEPLOY_TYPE == 'pages' }}
+        id: deploy_pages
         working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
         run: |
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
@@ -262,10 +527,13 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 92 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-          npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true
+          OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1)
+          echo "$OUTPUT"
+          DEPLOY_URL=$(echo "$OUTPUT" | grep -oE 'https://[^[:space:]]+\.pages\.dev' | tail -1 || true)
+          echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
 
-      - name: Redeploy to apply bindings
-        id: deploy
+      - name: Redeploy Pages to apply bindings
+        if: ${{ env.DEPLOY_TYPE == 'pages' && env.DEPLOY_MODE != 'update' }}
         working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
         run: |
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
@@ -277,12 +545,43 @@ jobs:
 
           OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1)
           echo "$OUTPUT"
-          DEPLOY_URL=$(echo "$OUTPUT" | grep -oP 'https://[a-z0-9]+\.\S+\.pages\.dev' | tail -1)
-          echo "DEPLOY_URL=$DEPLOY_URL" >> $GITHUB_OUTPUT
+
+      - name: Deploy to Worker
+        if: ${{ env.DEPLOY_TYPE == 'worker' }}
+        id: deploy_worker
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "deploying_code" \
+            --arg messageCode "STAGE_DEPLOYING_CODE" --arg message "Deploying Worker" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 92 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+          OUTPUT=$(npx wrangler deploy --name "$PROJECT_NAME" --config wrangler.toml 2>&1)
+          echo "$OUTPUT"
+          DEPLOY_URL=$(echo "$OUTPUT" | grep -oE 'https://[^[:space:]]+\.workers\.dev' | tail -1 || true)
+
+          echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
+
+      - name: Finalize Worker deployment
+        if: ${{ env.DEPLOY_TYPE == 'worker' }}
+        run: |
+          /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
+            --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "finalizing" \
+            --arg messageCode "STAGE_FINALIZING" --arg message "Finalizing Worker deployment" \
+            --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
+            --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --argjson percent 97 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
       - name: Report success
         run: |
-          DEPLOY_URL="${{ steps.deploy.outputs.DEPLOY_URL }}"
+          if [ "$DEPLOY_TYPE" = "worker" ]; then
+            DEPLOY_URL="${{ steps.deploy_worker.outputs.DEPLOY_URL }}"
+          else
+            DEPLOY_URL="${{ steps.deploy_pages.outputs.DEPLOY_URL }}"
+          fi
+
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
             --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "completed" \
             --arg messageCode "STAGE_COMPLETED" --arg message "Deployment completed" --arg projectUrl "$DEPLOY_URL" \
