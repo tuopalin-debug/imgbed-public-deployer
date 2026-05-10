@@ -58,7 +58,7 @@ jobs:
 
     steps:
       - name: Checkout public runner
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Validate deployment inputs
         run: |
@@ -92,7 +92,7 @@ jobs:
           fi
 
       - name: Checkout private deployer source
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: ${{ steps.source.outputs.repo }}
           token: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
@@ -100,9 +100,9 @@ jobs:
           persist-credentials: false
 
       - name: Setup Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v5
         with:
-          node-version: "20"
+          node-version: "24"
 
       - name: Install Wrangler
         run: npm install -g wrangler
