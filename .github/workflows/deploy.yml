@@ -159,6 +159,23 @@ jobs:
 
           chmod +x /tmp/report-progress.sh
 
+          cat > /tmp/sanitize-sensitive-output.sh <<'EOF'
+          #!/usr/bin/env bash
+          set -euo pipefail
+
+          OUTPUT=$(cat)
+          for VALUE in "$@"; do
+            if [ -n "$VALUE" ]; then
+              SUFFIX="${VALUE: -4}"
+              OUTPUT="${OUTPUT//$VALUE/****$SUFFIX}"
+            fi
+          done
+
+          printf '%s\n' "$OUTPUT"
+          EOF
+
+          chmod +x /tmp/sanitize-sensitive-output.sh
+
       - name: Configure Wrangler OAuth
         run: |
           mkdir -p ~/.wrangler/config
@@ -184,7 +201,8 @@ jobs:
           fi
 
           echo "ACCOUNT_ID=$ACCOUNT_ID" >> "$GITHUB_OUTPUT"
-          echo "Account ID: $ACCOUNT_ID"
+          echo "::add-mask::$ACCOUNT_ID"
+          echo "Account ID suffix: ****${ACCOUNT_ID: -4}"
 
       - name: Export Cloudflare account env
         run: |
@@ -249,6 +267,16 @@ jobs:
           echo "PROJECT_EXISTS=$PROJECT_EXISTS" >> "$GITHUB_OUTPUT"
           echo "KV_ID=$KV_ID" >> "$GITHUB_OUTPUT"
           echo "D1_ID=$D1_ID" >> "$GITHUB_OUTPUT"
+
+          if [ -n "$KV_ID" ]; then
+            echo "::add-mask::$KV_ID"
+            echo "KV namespace suffix: ****${KV_ID: -4}"
+          fi
+
+          if [ -n "$D1_ID" ]; then
+            echo "::add-mask::$D1_ID"
+            echo "D1 database suffix: ****${D1_ID: -4}"
+          fi
 
       - name: Validate deployment mode state
         run: |
@@ -345,7 +373,18 @@ jobs:
             echo "Rebuild mode: reusing KV namespace imgbed_kv"
           else
             echo "Creating KV namespace: imgbed_kv"
-            npx wrangler kv namespace create "imgbed_kv"
+            if ! CREATE_OUTPUT=$(npx wrangler kv namespace create "imgbed_kv" 2>&1); then
+              printf '%s\n' "$CREATE_OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}"
+              exit 1
+            fi
+
+            CREATED_KV_ID=$(printf '%s\n' "$CREATE_OUTPUT" | grep -oE 'id = "[0-9a-f]+"' | head -n 1 | grep -oE '[0-9a-f]+' || true)
+            if [ -n "$CREATED_KV_ID" ]; then
+              echo "::add-mask::$CREATED_KV_ID"
+              echo "KV namespace created: ****${CREATED_KV_ID: -4}"
+            else
+              echo "KV namespace created"
+            fi
           fi
 
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
@@ -376,7 +415,18 @@ jobs:
             echo "Rebuild mode: reusing D1 database imgbed_db"
           else
             echo "Creating D1 database: imgbed_db"
-            npx wrangler d1 create "imgbed_db"
+            if ! CREATE_OUTPUT=$(npx wrangler d1 create "imgbed_db" 2>&1); then
+              printf '%s\n' "$CREATE_OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}"
+              exit 1
+            fi
+
+            CREATED_D1_ID=$(printf '%s\n' "$CREATE_OUTPUT" | grep -oE 'database_id = "[0-9a-f-]+"' | head -n 1 | grep -oE '[0-9a-f-]+' || true)
+            if [ -n "$CREATED_D1_ID" ]; then
+              echo "::add-mask::$CREATED_D1_ID"
+              echo "D1 database created: ****${CREATED_D1_ID: -4}"
+            else
+              echo "D1 database created"
+            fi
           fi
 
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
@@ -435,6 +485,10 @@ jobs:
 
           echo "KV_ID=$KV_ID" >> "$GITHUB_OUTPUT"
           echo "D1_ID=$D1_ID" >> "$GITHUB_OUTPUT"
+          echo "::add-mask::$KV_ID"
+          echo "::add-mask::$D1_ID"
+          echo "KV namespace suffix: ****${KV_ID: -4}"
+          echo "D1 database suffix: ****${D1_ID: -4}"
 
       - name: Initialize D1 database
         if: ${{ env.DEPLOY_MODE != 'update' }}
@@ -448,7 +502,12 @@ jobs:
           fi
 
           # 新建和重建都要把 imgbed_db 初始化到可直接使用；更新只发代码，不修数据库。
-          npx wrangler d1 execute "imgbed_db" --remote --file database/init.sql
+          if ! INIT_OUTPUT=$(npx wrangler d1 execute "imgbed_db" --remote --file database/init.sql 2>&1); then
+            printf '%s\n' "$INIT_OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.resources.outputs.D1_ID }}"
+            exit 1
+          fi
+
+          printf '%s\n' "$INIT_OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.resources.outputs.D1_ID }}"
 
       - name: Bind Pages resources via API
         if: ${{ env.DEPLOY_TYPE == 'pages' && env.DEPLOY_MODE != 'update' }}
@@ -539,7 +598,7 @@ jobs:
             --argjson percent 92 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
           OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1)
-          echo "$OUTPUT"
+          printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
           DEPLOY_URL=$(echo "$OUTPUT" | grep -oE 'https://[^[:space:]]+\.pages\.dev' | tail -1 || true)
           echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
 
@@ -555,7 +614,7 @@ jobs:
             --argjson percent 97 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
           OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1)
-          echo "$OUTPUT"
+          printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
 
       - name: Deploy to Worker
         if: ${{ env.DEPLOY_TYPE == 'worker' }}
@@ -570,7 +629,7 @@ jobs:
             --argjson percent 92 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
           OUTPUT=$(npx wrangler deploy --name "$PROJECT_NAME" --config wrangler.toml 2>&1)
-          echo "$OUTPUT"
+          printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
           DEPLOY_URL=$(echo "$OUTPUT" | grep -oE 'https://[^[:space:]]+\.workers\.dev' | tail -1 || true)
 
           echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
