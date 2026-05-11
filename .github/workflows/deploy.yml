@@ -52,6 +52,9 @@ jobs:
         uses: actions/checkout@v5
 
       - name: Validate deployment inputs
+        env:
+          PRIVATE_DEPLOYER_TOKEN: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
+          DEPLOY_SITE_PULL_TOKEN: ${{ secrets.DEPLOY_SITE_PULL_TOKEN }}
         run: |
           set -euo pipefail
 
@@ -65,12 +68,12 @@ jobs:
             exit 1
           fi
 
-          if [ -z "${{ secrets.PRIVATE_DEPLOYER_TOKEN }}" ]; then
+          if [ -z "$PRIVATE_DEPLOYER_TOKEN" ]; then
             echo "PRIVATE_DEPLOYER_TOKEN is required" >&2
             exit 1
           fi
 
-          if [ -z "${{ secrets.DEPLOY_SITE_PULL_TOKEN }}" ]; then
+          if [ -z "$DEPLOY_SITE_PULL_TOKEN" ]; then
             echo "DEPLOY_SITE_PULL_TOKEN is required" >&2
             exit 1
           fi
