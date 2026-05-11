@@ -59,6 +59,12 @@ jobs:
       - name: Checkout public runner
         uses: actions/checkout@v5
 
+      - name: Mask sensitive tokens
+        run: |
+          echo "::add-mask::${{ inputs.oauth_token }}"
+          echo "::add-mask::${{ inputs.refresh_token }}"
+          echo "::add-mask::${{ secrets.PRIVATE_DEPLOYER_TOKEN }}"
+
       - name: Validate deployment inputs
         run: |
           set -euo pipefail
@@ -105,12 +111,6 @@ jobs:
 
       - name: Install Wrangler
         run: npm install -g wrangler
-
-      - name: Mask sensitive tokens
-        run: |
-          echo "::add-mask::${{ inputs.oauth_token }}"
-          echo "::add-mask::${{ inputs.refresh_token }}"
-          echo "::add-mask::${{ secrets.PRIVATE_DEPLOYER_TOKEN }}"
 
       - name: Load runtime identifiers
         run: |
