@@ -119,6 +119,7 @@ jobs:
           TASK_ID_VALUE=$(jq -r '.inputs.task_id // ""' "$GITHUB_EVENT_PATH")
           if [ -n "$TASK_ID_VALUE" ]; then
             echo "::add-mask::$TASK_ID_VALUE"
+            echo "Task ID suffix: ****${TASK_ID_VALUE: -4}"
           fi
 
           echo "TASK_ID=$TASK_ID_VALUE" >> "$GITHUB_ENV"
