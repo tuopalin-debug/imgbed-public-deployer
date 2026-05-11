@@ -34,11 +34,9 @@ env:
   PROJECT_NAME: ${{ inputs.project_name }}
   DEPLOY_TYPE: ${{ inputs.deploy_type }}
   DEPLOY_MODE: ${{ inputs.deploy_mode }}
-  CALLBACK_URL: https://glow.ccwu.cc/api/progress
-  DEPLOY_SITE_CREDENTIALS_URL: https://glow.ccwu.cc/api/workflow/credentials
+  CALLBACK_URL: ${{ secrets.DEPLOY_SITE_PROGRESS_URL }}
+  DEPLOY_SITE_CREDENTIALS_URL: ${{ secrets.DEPLOY_SITE_CREDENTIALS_URL }}
   PRIVATE_SOURCE_DIR: private-deployer-source
-  PAGES_SOURCE_REPO: tuopalin-debug/CloudFlare-ImgBed-pages
-  WORKER_SOURCE_REPO: tuopalin-debug/CloudFlare-ImgBed-worker
 
 jobs:
   deploy:
@@ -55,8 +53,16 @@ jobs:
         env:
           PRIVATE_DEPLOYER_TOKEN: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
           DEPLOY_SITE_PULL_TOKEN: ${{ secrets.DEPLOY_SITE_PULL_TOKEN }}
+          PAGES_SOURCE_REPO: ${{ secrets.PAGES_SOURCE_REPO }}
+          WORKER_SOURCE_REPO: ${{ secrets.WORKER_SOURCE_REPO }}
         run: |
           set -euo pipefail
+
+          for SECRET_VALUE in "$CALLBACK_URL" "$DEPLOY_SITE_CREDENTIALS_URL" "$PAGES_SOURCE_REPO" "$WORKER_SOURCE_REPO"; do
+            if [ -n "$SECRET_VALUE" ]; then
+              echo "::add-mask::$SECRET_VALUE"
+            fi
+          done
 
           if [ "$DEPLOY_TYPE" != "pages" ] && [ "$DEPLOY_TYPE" != "worker" ]; then
             echo "Unsupported deploy_type: $DEPLOY_TYPE" >&2
@@ -78,22 +84,40 @@ jobs:
             exit 1
           fi
 
-      - name: Resolve private source repository
-        id: source
-        run: |
-          set -euo pipefail
-
-          # deploy_type 只在这里决定源码仓库，后续步骤只读同一个目录，路线更直观。
-          if [ "$DEPLOY_TYPE" = "worker" ]; then
-            echo "repo=$WORKER_SOURCE_REPO" >> "$GITHUB_OUTPUT"
-          else
-            echo "repo=$PAGES_SOURCE_REPO" >> "$GITHUB_OUTPUT"
+          if [ -z "$CALLBACK_URL" ]; then
+            echo "DEPLOY_SITE_PROGRESS_URL is required" >&2
+            exit 1
           fi
 
-      - name: Checkout private deployer source
+          if [ -z "$DEPLOY_SITE_CREDENTIALS_URL" ]; then
+            echo "DEPLOY_SITE_CREDENTIALS_URL is required" >&2
+            exit 1
+          fi
+
+          if [ -z "$PAGES_SOURCE_REPO" ]; then
+            echo "PAGES_SOURCE_REPO is required" >&2
+            exit 1
+          fi
+
+          if [ -z "$WORKER_SOURCE_REPO" ]; then
+            echo "WORKER_SOURCE_REPO is required" >&2
+            exit 1
+          fi
+
+      - name: Checkout private worker source
+        if: ${{ env.DEPLOY_TYPE == 'worker' }}
         uses: actions/checkout@v5
         with:
-          repository: ${{ steps.source.outputs.repo }}
+          repository: ${{ secrets.WORKER_SOURCE_REPO }}
+          token: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
+          path: ${{ env.PRIVATE_SOURCE_DIR }}
+          persist-credentials: false
+
+      - name: Checkout private pages source
+        if: ${{ env.DEPLOY_TYPE == 'pages' }}
+        uses: actions/checkout@v5
+        with:
+          repository: ${{ secrets.PAGES_SOURCE_REPO }}
           token: ${{ secrets.PRIVATE_DEPLOYER_TOKEN }}
           path: ${{ env.PRIVATE_SOURCE_DIR }}
           persist-credentials: false
