@@ -43,7 +43,6 @@ env:
   DEPLOY_TYPE: ${{ inputs.deploy_type }}
   DEPLOY_MODE: ${{ inputs.deploy_mode }}
   OAUTH_TOKEN: ${{ inputs.oauth_token }}
-  TASK_ID: ${{ inputs.task_id }}
   CALLBACK_URL: https://glow.ccwu.cc/api/progress
   PRIVATE_SOURCE_DIR: private-deployer-source
   PAGES_SOURCE_REPO: tuopalin-debug/CloudFlare-ImgBed-pages
@@ -113,6 +112,17 @@ jobs:
           echo "::add-mask::${{ inputs.refresh_token }}"
           echo "::add-mask::${{ secrets.PRIVATE_DEPLOYER_TOKEN }}"
 
+      - name: Load runtime identifiers
+        run: |
+          set -euo pipefail
+
+          TASK_ID_VALUE=$(jq -r '.inputs.task_id // ""' "$GITHUB_EVENT_PATH")
+          if [ -n "$TASK_ID_VALUE" ]; then
+            echo "::add-mask::$TASK_ID_VALUE"
+          fi
+
+          echo "TASK_ID=$TASK_ID_VALUE" >> "$GITHUB_ENV"
+
       - name: Prepare progress reporter
         run: |
           cat > /tmp/report-progress.sh <<'EOF'
@@ -129,7 +139,7 @@ jobs:
           fi
 
           while [ "$ATTEMPT" -le "$MAX_ATTEMPTS" ]; do
-            if curl -fsS --retry 0 --max-time 15 -X POST "$CALLBACK_URL" \
+            if curl -fsS --retry 0 --max-time 15 -o /dev/null -X POST "$CALLBACK_URL" \
               -H "Content-Type: application/json" \
               -d "$PAYLOAD"; then
               exit 0
