@@ -22,17 +22,9 @@ on:
           - new
           - update
           - rebuild
-      oauth_token:
-        description: "Cloudflare OAuth access token"
-        required: true
-        type: string
-      refresh_token:
-        description: "Cloudflare OAuth refresh token"
-        required: false
-        type: string
       task_id:
         description: "Task ID for progress callback"
-        required: false
+        required: true
         type: string
 
 permissions:
@@ -42,8 +34,8 @@ env:
   PROJECT_NAME: ${{ inputs.project_name }}
   DEPLOY_TYPE: ${{ inputs.deploy_type }}
   DEPLOY_MODE: ${{ inputs.deploy_mode }}
-  OAUTH_TOKEN: ${{ inputs.oauth_token }}
   CALLBACK_URL: https://glow.ccwu.cc/api/progress
+  DEPLOY_SITE_CREDENTIALS_URL: https://glow.ccwu.cc/api/workflow/credentials
   PRIVATE_SOURCE_DIR: private-deployer-source
   PAGES_SOURCE_REPO: tuopalin-debug/CloudFlare-ImgBed-pages
   WORKER_SOURCE_REPO: tuopalin-debug/CloudFlare-ImgBed-worker
@@ -58,12 +50,6 @@ jobs:
     steps:
       - name: Checkout public runner
         uses: actions/checkout@v5
-
-      - name: Mask sensitive tokens
-        run: |
-          echo "::add-mask::${{ inputs.oauth_token }}"
-          echo "::add-mask::${{ inputs.refresh_token }}"
-          echo "::add-mask::${{ secrets.PRIVATE_DEPLOYER_TOKEN }}"
 
       - name: Validate deployment inputs
         run: |
@@ -81,6 +67,11 @@ jobs:
 
           if [ -z "${{ secrets.PRIVATE_DEPLOYER_TOKEN }}" ]; then
             echo "PRIVATE_DEPLOYER_TOKEN is required" >&2
+            exit 1
+          fi
+
+          if [ -z "${{ secrets.DEPLOY_SITE_PULL_TOKEN }}" ]; then
+            echo "DEPLOY_SITE_PULL_TOKEN is required" >&2
             exit 1
           fi
 
@@ -123,6 +114,39 @@ jobs:
           fi
 
           echo "TASK_ID=$TASK_ID_VALUE" >> "$GITHUB_ENV"
+
+      - name: Load Cloudflare credentials
+        env:
+          DEPLOY_SITE_PULL_TOKEN: ${{ secrets.DEPLOY_SITE_PULL_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TASK_ID" ]; then
+            echo "task_id is required before loading credentials" >&2
+            exit 1
+          fi
+
+          # OAuth token 不再作为 workflow input 进入公开日志；这里只用 task_id 向部署站领取本次任务凭证。
+          CREDENTIAL_RESPONSE=$(curl -fsS --max-time 20 -X POST "$DEPLOY_SITE_CREDENTIALS_URL" \
+            -H "Authorization: Bearer $DEPLOY_SITE_PULL_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg taskId "$TASK_ID" '{taskId:$taskId}')")
+
+          OAUTH_TOKEN_VALUE=$(printf '%s\n' "$CREDENTIAL_RESPONSE" | jq -r '.oauthToken // empty')
+          REFRESH_TOKEN_VALUE=$(printf '%s\n' "$CREDENTIAL_RESPONSE" | jq -r '.refreshToken // empty')
+
+          if [ -z "$OAUTH_TOKEN_VALUE" ]; then
+            echo "Cloudflare OAuth token is empty" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::$OAUTH_TOKEN_VALUE"
+          if [ -n "$REFRESH_TOKEN_VALUE" ]; then
+            echo "::add-mask::$REFRESH_TOKEN_VALUE"
+          fi
+
+          echo "OAUTH_TOKEN=$OAUTH_TOKEN_VALUE" >> "$GITHUB_ENV"
+          echo "REFRESH_TOKEN=$REFRESH_TOKEN_VALUE" >> "$GITHUB_ENV"
 
       - name: Prepare progress reporter
         run: |
@@ -180,8 +204,8 @@ jobs:
         run: |
           mkdir -p ~/.wrangler/config
           cat > ~/.wrangler/config/default.toml <<EOF
-          oauth_token = "${{ inputs.oauth_token }}"
-          refresh_token = "${{ inputs.refresh_token }}"
+          oauth_token = "$OAUTH_TOKEN"
+          refresh_token = "$REFRESH_TOKEN"
           expiration_time = "2099-12-31T23:59:59Z"
           scopes = [ "account:read", "user:read", "workers:write", "workers_kv:write", "workers_routes:write", "workers_scripts:write", "workers_tail:read", "d1:write", "pages:write", "zone:read", "offline_access" ]
           EOF
