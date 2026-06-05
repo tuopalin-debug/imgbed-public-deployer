@@ -142,39 +142,6 @@ jobs:
 
           echo "TASK_ID=$TASK_ID_VALUE" >> "$GITHUB_ENV"
 
-      - name: Load Cloudflare credentials
-        env:
-          DEPLOY_SITE_PULL_TOKEN: ${{ secrets.DEPLOY_SITE_PULL_TOKEN }}
-        run: |
-          set -euo pipefail
-
-          if [ -z "$TASK_ID" ]; then
-            echo "task_id is required before loading credentials" >&2
-            exit 1
-          fi
-
-          # OAuth token 不再作为 workflow input 进入公开日志；这里只用 task_id 向部署站领取本次任务凭证。
-          CREDENTIAL_RESPONSE=$(curl -fsS --max-time 20 -X POST "$DEPLOY_SITE_CREDENTIALS_URL" \
-            -H "Authorization: Bearer $DEPLOY_SITE_PULL_TOKEN" \
-            -H "Content-Type: application/json" \
-            -d "$(jq -nc --arg taskId "$TASK_ID" '{taskId:$taskId}')")
-
-          OAUTH_TOKEN_VALUE=$(printf '%s\n' "$CREDENTIAL_RESPONSE" | jq -r '.oauthToken // empty')
-          REFRESH_TOKEN_VALUE=$(printf '%s\n' "$CREDENTIAL_RESPONSE" | jq -r '.refreshToken // empty')
-
-          if [ -z "$OAUTH_TOKEN_VALUE" ]; then
-            echo "Cloudflare OAuth token is empty" >&2
-            exit 1
-          fi
-
-          echo "::add-mask::$OAUTH_TOKEN_VALUE"
-          if [ -n "$REFRESH_TOKEN_VALUE" ]; then
-            echo "::add-mask::$REFRESH_TOKEN_VALUE"
-          fi
-
-          echo "OAUTH_TOKEN=$OAUTH_TOKEN_VALUE" >> "$GITHUB_ENV"
-          echo "REFRESH_TOKEN=$REFRESH_TOKEN_VALUE" >> "$GITHUB_ENV"
-
       - name: Prepare progress reporter
         run: |
           cat > /tmp/report-progress.sh <<'EOF'
@@ -226,6 +193,40 @@ jobs:
           EOF
 
           chmod +x /tmp/sanitize-sensitive-output.sh
+
+      - name: Load Cloudflare credentials
+        env:
+          DEPLOY_SITE_PULL_TOKEN: ${{ secrets.DEPLOY_SITE_PULL_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          if [ -z "$TASK_ID" ]; then
+            echo "task_id is required before loading credentials" >&2
+            exit 1
+          fi
+
+          # OAuth token 不再作为 workflow input 进入公开日志；这里只用 task_id 向部署站领取本次任务凭证。
+          # 部署站偶发冷启动或网络抖动时，允许 curl 自己重试，避免 20 秒一次性超时直接中断更新。
+          CREDENTIAL_RESPONSE=$(curl -fsS --retry 3 --retry-all-errors --retry-delay 2 --connect-timeout 10 --max-time 60 -X POST "$DEPLOY_SITE_CREDENTIALS_URL" \
+            -H "Authorization: Bearer $DEPLOY_SITE_PULL_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$(jq -nc --arg taskId "$TASK_ID" '{taskId:$taskId}')")
+
+          OAUTH_TOKEN_VALUE=$(printf '%s\n' "$CREDENTIAL_RESPONSE" | jq -r '.oauthToken // empty')
+          REFRESH_TOKEN_VALUE=$(printf '%s\n' "$CREDENTIAL_RESPONSE" | jq -r '.refreshToken // empty')
+
+          if [ -z "$OAUTH_TOKEN_VALUE" ]; then
+            echo "Cloudflare OAuth token is empty" >&2
+            exit 1
+          fi
+
+          echo "::add-mask::$OAUTH_TOKEN_VALUE"
+          if [ -n "$REFRESH_TOKEN_VALUE" ]; then
+            echo "::add-mask::$REFRESH_TOKEN_VALUE"
+          fi
+
+          echo "OAUTH_TOKEN=$OAUTH_TOKEN_VALUE" >> "$GITHUB_ENV"
+          echo "REFRESH_TOKEN=$REFRESH_TOKEN_VALUE" >> "$GITHUB_ENV"
 
       - name: Configure Wrangler OAuth
         run: |
