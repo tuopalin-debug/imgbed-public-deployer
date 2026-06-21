@@ -26,6 +26,15 @@ on:
         description: "Task ID for progress callback"
         required: true
         type: string
+      activation_level_code:
+        description: "Local activation level code"
+        required: false
+        default: "0"
+        type: choice
+        options:
+          - "0"
+          - "1"
+          - "2"
 
 permissions:
   contents: read
@@ -34,6 +43,7 @@ env:
   PROJECT_NAME: ${{ inputs.project_name }}
   DEPLOY_TYPE: ${{ inputs.deploy_type }}
   DEPLOY_MODE: ${{ inputs.deploy_mode }}
+  ACTIVATION_LEVEL_CODE: ${{ inputs.activation_level_code }}
   CALLBACK_URL: ${{ secrets.DEPLOY_SITE_PROGRESS_URL }}
   DEPLOY_SITE_CREDENTIALS_URL: ${{ secrets.DEPLOY_SITE_CREDENTIALS_URL }}
   PRIVATE_SOURCE_DIR: private-deployer-source
@@ -71,6 +81,11 @@ jobs:
 
           if [ "$DEPLOY_MODE" != "new" ] && [ "$DEPLOY_MODE" != "update" ] && [ "$DEPLOY_MODE" != "rebuild" ]; then
             echo "Unsupported deploy_mode: $DEPLOY_MODE" >&2
+            exit 1
+          fi
+
+          if [ "$ACTIVATION_LEVEL_CODE" != "0" ] && [ "$ACTIVATION_LEVEL_CODE" != "1" ] && [ "$ACTIVATION_LEVEL_CODE" != "2" ]; then
+            echo "Unsupported activation_level_code: $ACTIVATION_LEVEL_CODE" >&2
             exit 1
           fi
 
@@ -508,6 +523,31 @@ jobs:
             --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 74 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
+
+      - name: Apply local activation level code
+        working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
+        run: |
+          set -euo pipefail
+
+          if [ "$ACTIVATION_LEVEL_CODE" != "0" ] && [ "$ACTIVATION_LEVEL_CODE" != "1" ] && [ "$ACTIVATION_LEVEL_CODE" != "2" ]; then
+            echo "Unsupported activation_level_code: $ACTIVATION_LEVEL_CODE" >&2
+            exit 1
+          fi
+
+          CHANGELOG_FILE="static/changelog.json"
+          if [ "$DEPLOY_TYPE" = "worker" ] && [ -f "dist/client/static/changelog.json" ]; then
+            CHANGELOG_FILE="dist/client/static/changelog.json"
+          fi
+
+          if [ ! -f "$CHANGELOG_FILE" ]; then
+            echo "Changelog file $CHANGELOG_FILE is missing" >&2
+            exit 1
+          fi
+
+          TMP_CHANGELOG="$(mktemp)"
+          jq --argjson activationLevelCode "$ACTIVATION_LEVEL_CODE" '.activationLevelCode = $activationLevelCode' "$CHANGELOG_FILE" > "$TMP_CHANGELOG"
+          mv "$TMP_CHANGELOG" "$CHANGELOG_FILE"
+          gzip -c "$CHANGELOG_FILE" > "$CHANGELOG_FILE.gz"
 
       - name: Resolve Cloudflare resources
         if: ${{ env.DEPLOY_MODE != 'update' || env.DEPLOY_TYPE == 'worker' }}
