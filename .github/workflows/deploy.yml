@@ -545,7 +545,12 @@ jobs:
           fi
 
           TMP_CHANGELOG="$(mktemp)"
-          jq --argjson activationLevelCode "$ACTIVATION_LEVEL_CODE" '.activationLevelCode = $activationLevelCode' "$CHANGELOG_FILE" > "$TMP_CHANGELOG"
+          SPONSOR_REMINDER_AFTER=$(( ($(date +%s) + 30 * 24 * 60 * 60) * 1000 ))
+          jq \
+            --argjson activationLevelCode "$ACTIVATION_LEVEL_CODE" \
+            --argjson sponsorReminderAfter "$SPONSOR_REMINDER_AFTER" \
+            '.activationLevelCode = $activationLevelCode | .sponsorReminderAfter = $sponsorReminderAfter' \
+            "$CHANGELOG_FILE" > "$TMP_CHANGELOG"
           mv "$TMP_CHANGELOG" "$CHANGELOG_FILE"
           gzip -c "$CHANGELOG_FILE" > "$CHANGELOG_FILE.gz"
 
