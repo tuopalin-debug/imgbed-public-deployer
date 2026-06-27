@@ -733,6 +733,10 @@ jobs:
 
           if ! OUTPUT=$(npx wrangler deploy --name "$PROJECT_NAME" --config wrangler.toml 2>&1); then
             printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
+            if printf '%s\n' "$OUTPUT" | grep -qiE 'workers\.dev subdomain|register a workers\.dev|publishing to workers\.dev'; then
+              echo "WORKERS_DEV_SUBDOMAIN_REQUIRED" > /tmp/deploy-error-code
+              echo "WORKERS_DEV_SUBDOMAIN_REQUIRED" > /tmp/deploy-error-message
+            fi
             exit 1
           fi
           printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
@@ -769,10 +773,12 @@ jobs:
       - name: Report failure
         if: failure()
         run: |
+          ERROR_CODE="$(cat /tmp/deploy-error-code 2>/dev/null || echo WORKFLOW_STEP_FAILED)"
+          ERROR_MESSAGE="$(cat /tmp/deploy-error-message 2>/dev/null || echo Deployment failed)"
           /tmp/report-progress.sh "$CALLBACK_URL" "$(jq -nc \
             --arg taskId "$TASK_ID" --arg projectName "$PROJECT_NAME" --arg stage "failed" \
             --arg messageCode "STAGE_FAILED" --arg message "Deployment failed" \
-            --arg errorCode "WORKFLOW_STEP_FAILED" --arg error "Deployment failed" \
+            --arg errorCode "$ERROR_CODE" --arg error "$ERROR_MESSAGE" \
             --arg githubRunId "${{ github.run_id }}" --argjson githubRunAttempt ${{ github.run_attempt }} \
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,errorCode:$errorCode,error:$error,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
