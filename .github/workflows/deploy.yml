@@ -694,7 +694,10 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 92 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-          OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1)
+          if ! OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1); then
+            printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
+            exit 1
+          fi
           printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
           DEPLOY_URL=$(echo "$OUTPUT" | grep -oE 'https://[^[:space:]]+\.pages\.dev' | tail -1 || true)
           echo "DEPLOY_URL=$DEPLOY_URL" >> "$GITHUB_OUTPUT"
@@ -710,7 +713,10 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 97 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-          OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1)
+          if ! OUTPUT=$(npx wrangler pages deploy . --project-name "$PROJECT_NAME" --branch main --commit-dirty=true 2>&1); then
+            printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
+            exit 1
+          fi
           printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
 
       - name: Deploy to Worker
@@ -725,7 +731,10 @@ jobs:
             --arg workflowName "${{ github.workflow }}" --arg runUrl "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
             --argjson percent 92 '{taskId:$taskId,projectName:$projectName,stage:$stage,messageCode:$messageCode,message:$message,percent:$percent,githubRunId:$githubRunId,githubRunAttempt:$githubRunAttempt,workflowName:$workflowName,runUrl:$runUrl}')"
 
-          OUTPUT=$(npx wrangler deploy --name "$PROJECT_NAME" --config wrangler.toml 2>&1)
+          if ! OUTPUT=$(npx wrangler deploy --name "$PROJECT_NAME" --config wrangler.toml 2>&1); then
+            printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
+            exit 1
+          fi
           printf '%s\n' "$OUTPUT" | /tmp/sanitize-sensitive-output.sh "${{ steps.account.outputs.ACCOUNT_ID }}" "${{ steps.resources.outputs.KV_ID }}" "${{ steps.resources.outputs.D1_ID }}"
           DEPLOY_URL=$(echo "$OUTPUT" | grep -oE 'https://[^[:space:]]+\.workers\.dev' | tail -1 || true)
 
