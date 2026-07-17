@@ -279,6 +279,78 @@ jobs:
           echo "CLOUDFLARE_API_TOKEN=$OAUTH_TOKEN" >> "$GITHUB_ENV"
           echo "CLOUDFLARE_ACCOUNT_ID=${{ steps.account.outputs.ACCOUNT_ID }}" >> "$GITHUB_ENV"
 
+      - name: Ensure workers.dev subdomain
+        if: ${{ env.DEPLOY_TYPE == 'worker' }}
+        run: |
+          set -euo pipefail
+
+          ACCOUNT_ID="${{ steps.account.outputs.ACCOUNT_ID }}"
+          SUBDOMAIN_URL="https://api.cloudflare.com/client/v4/accounts/$ACCOUNT_ID/workers/subdomain"
+          SUBDOMAIN_RESPONSE_FILE="/tmp/workers-subdomain-response.json"
+
+          fail_workers_dev_setup() {
+            ERROR_MESSAGE="$1"
+            echo "WORKERS_DEV_SUBDOMAIN_REQUIRED" > /tmp/deploy-error-code
+            echo "$ERROR_MESSAGE" > /tmp/deploy-error-message
+            echo "$ERROR_MESSAGE" >&2
+            exit 1
+          }
+
+          if ! SUBDOMAIN_STATUS=$(curl -sS -o "$SUBDOMAIN_RESPONSE_FILE" -w "%{http_code}" \
+            -H "Authorization: Bearer $OAUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$SUBDOMAIN_URL"); then
+            fail_workers_dev_setup "Unable to inspect workers.dev subdomain"
+          fi
+
+          if [ "$SUBDOMAIN_STATUS" = "200" ]; then
+            EXISTING_SUBDOMAIN=$(jq -r '.result.subdomain // empty' "$SUBDOMAIN_RESPONSE_FILE")
+            if [ -z "$EXISTING_SUBDOMAIN" ]; then
+              fail_workers_dev_setup "Cloudflare returned an empty workers.dev subdomain"
+            fi
+
+            echo "workers.dev subdomain already ready: $EXISTING_SUBDOMAIN.workers.dev"
+            exit 0
+          fi
+
+          ERROR_CODE=$(jq -r '.errors[0].code // empty' "$SUBDOMAIN_RESPONSE_FILE")
+          if [ "$SUBDOMAIN_STATUS" != "404" ] || [ "$ERROR_CODE" != "10007" ]; then
+            fail_workers_dev_setup "Unable to inspect workers.dev subdomain. HTTP $SUBDOMAIN_STATUS, code ${ERROR_CODE:-unknown}"
+          fi
+
+          # workers.dev 子域名全局唯一；使用账号 ID 的哈希生成稳定名称，同时不暴露账号 ID。
+          SUBDOMAIN_HASH=$(printf '%s' "$ACCOUNT_ID" | sha256sum | cut -c1-20)
+          NEW_SUBDOMAIN="linya-$SUBDOMAIN_HASH"
+          CREATE_PAYLOAD=$(jq -nc --arg subdomain "$NEW_SUBDOMAIN" '{subdomain:$subdomain}')
+
+          if ! CREATE_STATUS=$(curl -sS -o "$SUBDOMAIN_RESPONSE_FILE" -w "%{http_code}" -X PUT \
+            -H "Authorization: Bearer $OAUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            -d "$CREATE_PAYLOAD" \
+            "$SUBDOMAIN_URL"); then
+            fail_workers_dev_setup "Unable to create workers.dev subdomain"
+          fi
+
+          CREATE_SUCCESS=$(jq -r '.success // false' "$SUBDOMAIN_RESPONSE_FILE")
+          if [ "$CREATE_STATUS" != "200" ] || [ "$CREATE_SUCCESS" != "true" ]; then
+            CREATE_ERROR_CODE=$(jq -r '.errors[0].code // empty' "$SUBDOMAIN_RESPONSE_FILE")
+            fail_workers_dev_setup "Unable to create workers.dev subdomain. HTTP $CREATE_STATUS, code ${CREATE_ERROR_CODE:-unknown}"
+          fi
+
+          if ! VERIFY_STATUS=$(curl -sS -o "$SUBDOMAIN_RESPONSE_FILE" -w "%{http_code}" \
+            -H "Authorization: Bearer $OAUTH_TOKEN" \
+            -H "Content-Type: application/json" \
+            "$SUBDOMAIN_URL"); then
+            fail_workers_dev_setup "Unable to verify workers.dev subdomain"
+          fi
+
+          VERIFIED_SUBDOMAIN=$(jq -r '.result.subdomain // empty' "$SUBDOMAIN_RESPONSE_FILE")
+          if [ "$VERIFY_STATUS" != "200" ] || [ -z "$VERIFIED_SUBDOMAIN" ]; then
+            fail_workers_dev_setup "workers.dev subdomain verification failed"
+          fi
+
+          echo "workers.dev subdomain created: $VERIFIED_SUBDOMAIN.workers.dev"
+
       - name: Report workflow started
         working-directory: ${{ env.PRIVATE_SOURCE_DIR }}
         run: |
